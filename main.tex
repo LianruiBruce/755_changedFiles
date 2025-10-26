@@ -1,0 +1,182 @@
+\documentclass{article}
+
+% --- NeurIPS 2018 style (camera-ready look).
+% Pass options to natbib before loading neurips_2018
+\PassOptionsToPackage{numbers,compress}{natbib}
+\usepackage[final]{neurips_2018}
+
+% --- Common packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{graphicx} % For including figures later
+
+% --- handy macros
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+
+\title{Image Inpainting with Latent Flow Matching: Midway Report}
+
+% Cleaned author block to prevent U+00A0 errors
+\author{
+  Cheng Zhang \And
+  Xiaowei Yin\And
+  Lianrui Geng \And
+  Chenrui Li
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Image inpainting aims to fill missing image regions with content that is both perceptually realistic and semantically consistent. Classical PDE-based methods are fast but degrade on large masks. Modern deep generative models---particularly latent diffusion models (LDMs)---achieve high fidelity yet incur slow, iterative sampling. We investigate \textbf{Latent Flow Matching (LFM)}, which couples a VAE-style autoencoder with flow matching (FM), an ODE-based generative framework that is simpler to train and faster to sample. We report: (i) a focused literature review centered on latent-space generative models; (ii) established PDE, GAN (Context Encoder), and LDM baselines confirming the quality-speed trade-off; (iii) a working image-space FM training core, validating our implementation; and (iv) the precise mathematical design for our latent-space inpainting conditioner. Upcoming milestones include full LFM model training, comprehensive quantitative/qualitative comparisons on CelebA and CIFAR-10, and a rigorous efficiency analysis against our LDM baseline.
+\end{abstract}
+
+\section{Introduction}
+
+Image inpainting addresses the challenge of restoring complete images from damaged inputs, where regions are occluded or corrupted. Formally, given an image $x \in \R^{H\times W\times C}$ and a binary mask $m \in \{0,1\}^{H\times W}$ (where $m{=}1$ denotes the unknown region $\Omega_U$), the task is to infer the missing content $x \odot m$ based on the known pixels $x_m = x \odot (1-m)$. This ill-posed problem requires a strong data prior to generate plausible and semantically coherent completions.
+
+Classical approaches, such as those based on Partial Differential Equations (PDEs), serve as computationally efficient baselines but are limited by their reliance on local information. They fail to generate novel semantic content, leading to blurry results on large holes. The advent of deep generative models, such as VAEs and GANs, introduced learned priors but often struggled with blurriness (VAEs) or training instability (GANs).
+
+The current state-of-the-art is held by Latent Diffusion Models (LDMs), which achieve high fidelity. LDMs combine two key ideas: a powerful autoencoder (VAE) that compresses images into a semantically rich, low-dimensional latent space, and a diffusion model that learns to generate data within this space. By operating in the latent space, they avoid the computational burden of pixel-space diffusion. However, their core generative process relies on iteratively solving a Stochastic Differential Equation (SDE), requiring hundreds of sequential, time-consuming sampling steps. This inference latency remains a significant bottleneck.
+
+This project investigates a direct solution to this critical quality-speed trade-off: \emph{Flow Matching (FM)}. FM is a recent generative framework that learns a deterministic velocity field, $v(z,t)$, which defines an Ordinary Differential Equation (ODE) path from a simple noise distribution to the data distribution. This formulation has two major advantages: 1) The training objective is a simple regression (e.g., $L_2$ loss), which is more stable than diffusion's score-matching objective. 2) Sampling is deterministic and significantly faster, as an ODE can be solved with high fidelity in far fewer function evaluations (NFE) than an SDE.
+
+Our core proposal is to implement and evaluate \emph{Latent Flow Matching (LFM)}, a method that applies this efficient FM framework inside the latent space of a pretrained VAE. Our central hypothesis is that LFM can match the high perceptual quality and semantic coherence of LDMs (by leveraging the same powerful VAE latent space) while dramatically reducing inference time, thereby offering a more practical and scalable solution for high-resolution image inpainting.
+
+\section{Related Work}
+
+Our methodology synthesizes ideas from latent-space modeling and modern generative flow-based models, while moving beyond classical approaches.
+
+\paragraph{Classical and Early Deep Learning Baselines.}
+We briefly acknowledge classical PDE-based models and patch-based methods as foundational. While fast, they are not our focus as they cannot generate novel semantic content. Early deep models like VAEs and GAN-based Context Encoders demonstrated the power of learned priors. VAEs enforce global consistency via their latent bottleneck but tend to produce overly smooth results. Context Encoders use an adversarial loss for sharper textures, but can suffer from training instability and semantic inconsistencies. These methods serve as important historical context for our latent-space approach.
+
+\paragraph{Latent Diffusion Models (LDMs).}
+LDMs represent the current high-fidelity standard. Their success is built on performing the generative process in the latent space of a well-trained autoencoder (VAE). This latent space, $z = \mathcal{E}(x)$, is perceptually equivalent to the pixel space but far more compact and semantically dense. The diffusion model learns to reverse a noise-adding SDE, $dz_t = f(z_t, t)dt + g(t)dw$, in this $z$-space. For inpainting, the LDM is conditioned on the latent representation of the masked image. While effective, the iterative, stochastic nature of the SDE solver requires a large NFE (e.g., $100-1000$ steps) for high-quality sampling, creating a significant inference bottleneck.
+
+\paragraph{Flow Matching (FM) and Latent Flow Matching (LFM).}
+Flow Matching offers a compelling alternative to diffusion. Instead of learning the score function $\nabla \log p_t(z_t)$ of a noisy distribution, FM directly learns the velocity field $v(z_t, t)$ of a deterministic probability flow $p_t(z)$. This flow is defined by an ODE, $\frac{dz_t}{dt} = v(z_t, t)$, which transports a simple prior $p_1$ (e.g., $\mathcal{N}(0,I)$) to the data distribution $p_0$. The training objective is a simple and stable regression, $\min_\theta \E[ \norm{ u_t(z|z_0) - v_\theta(z_t, t) }_2^2 ]$, where $u_t$ is the target velocity field. This avoids the complexities of score-matching and noise scheduling.
+
+Our work is based on \emph{Latent Flow Matching (LFM)}, a strategy that applies this efficient FM framework directly within the VAE's latent space. This approach is novel and directly competes with LDMs. It aims to combine the computational advantages of latent-space modeling (shared with LDM) with the distinct advantages of FM: training stability (simple $L_2$ regression) and, most importantly, fast sampling. Since an ODE is deterministic, it can be solved with modern numerical integrators (like Euler or Heun) in as few as 10-50 steps, promising a speed-up of one to two orders of magnitude over LDM.
+
+\section{Methods}
+
+Our methodology focuses on adapting the general LFM framework for the specific, conditional task of image inpainting.
+
+\paragraph{Architectural Framework.}
+Our system is composed of two primary, uncoupled components. First, we use a fixed, pretrained VAE consisting of an encoder $\mathcal{E}$ and a decoder $\mathcal{D}$. The encoder $\mathcal{E}: \R^{H\times W\times C} \to \R^{h\times w\times c}$ maps a high-resolution image $x$ to a compact latent representation $z_0 = \mathcal{E}(x)$. The decoder $\mathcal{D}: \R^{h\times w\times c} \to \R^{H\times W\times C}$ reconstructs the image $\hat{x} = \mathcal{D}(z_0)$. The VAE's role is to provide a semantically rich and low-dimensional manifold on which the generative process is more tractable.
+
+Second, we train a conditional, time-dependent vector field $v_{\theta}(z_t, c, t)$, parameterized by a neural network $\theta$ (e.g., a U-Net architecture). This network operates only in the latent space $z$.
+
+\paragraph{Latent Flow Matching Objective.}
+We learn a deterministic flow from a simple prior distribution $p_1$ (defined as $z_1 \sim \mathcal{N}(0, I)$ at $t=1$) to the target data distribution $p_0$ (the distribution of latents $z_0 = \mathcal{E}(x_0)$ from real images) at $t=0$. This flow is defined by the ODE:
+\begin{equation}
+\frac{dz_t}{dt} = v_{\theta}(z_t, c, t)
+\label{eq:ode}
+\end{equation}
+To train $v_{\theta}$, we use a simple linear interpolation path $z_t = (1-t)z_0 + t z_1$ for $t \in [0, 1]$. This path choice is simple and leads to a constant velocity target $u_t = z_1 - z_0$. The model $v_{\theta}$ is trained to predict this constant velocity vector. The loss function is a simple least-squares regression, sampling $t \sim \mathcal{U}[0, 1]$:
+\begin{equation}
+\mathcal{L}_{\text{LFM}}(\theta) = \E_{t, z_0, z_1, c} \left[ \norm{ (z_1 - z_0) - v_{\theta}(z_t, c, t) }_2^2 \right]
+\label{eq:lfm_loss}
+\end{equation}
+This objective is stable, avoids weighting functions, and directly optimizes the generative path.
+
+\paragraph{Conditioning for Inpainting.}
+To adapt this generative framework for inpainting, we must provide $v_{\theta}$ with the known image content as the condition $c$. Following the successful LDM strategy, our condition $c$ is derived from the masked image $x_m = x \odot (1-m)$ and the mask $m$.
+First, the corrupted image $x_m$ is passed through the same encoder $\mathcal{E}$ to obtain its latent representation: $z_m = \mathcal{E}(x_m)$. This provides the model with the rich semantic context of the known regions.
+Second, the binary mask $m$ is downsampled (e.g., via average pooling) to match the latent space dimensions $h \times w$, yielding $\overline{m}$. This provides the model with precise spatial information about where the inpainting should occur.
+The final condition $c$ is the channel-wise concatenation of these two tensors: $c = \text{concat}[z_m, \overline{m}]$. Thus, our model is trained to predict $v_{\theta}(z_t, c, t)$, where $z_t$ is the interpolated latent and $z_0 = \mathcal{E}(x_0)$ is the latent code of the \emph{ground truth} image.
+
+\paragraph{Inference Process.}
+At inference time, given $x_m$ and $m$: (1) We compute the condition $c = \text{concat}[\mathcal{E}(x_m), \overline{m}]$ once. (2) We sample a starting point from the prior: $z_1 \sim \mathcal{N}(0, I)$. (3) We solve the ODE (Eq.~\ref{eq:ode}) backwards from $t=1$ to $t=0$ using a numerical solver (e.g., Euler or Heun) with a small number of function evaluations (NFE):
+\begin{equation}
+\hat{z}_0 = z_1 - \int_{0}^{1} v_{\theta}(z_t, c, t) \, dt
+\label{eq:inference}
+\end{equation}
+(4) The final latent $\hat{z}_0$ is passed through the decoder to produce the inpainted image: $\hat{x} = \mathcal{D}(\hat{z}_0)$.
+
+\section{Preliminary Results}
+
+Our work to date has focused on establishing the foundations and baselines required for our proposed model. We have completed a comprehensive literature review of classical and modern inpainting methods, as well as the emerging field of flow matching. This review confirmed our project's motivation: the clear trade-off between the speed of classical methods and the quality of modern generative models, with LFM poised as a strong compromise.
+
+We have successfully set up and run a suite of baseline models to establish performance targets. This includes a classical PDE-based baseline (Navier–Stokes), a GAN-based baseline (Context Encoder), and a state-of-the-art Latent Diffusion Model (LDM). Our qualitative observations from these runs confirm our initial expectations. The PDE baseline is effective only on very thin scratches and produces significant blurry artifacts on larger, more complex masks. The Context Encoder produces sharper results but often fails to maintain global semantic consistency. The LDM baseline, while computationally intensive, produces high-fidelity, semantically coherent results, serving as our SOTA performance target. Its slow sampling speed (requiring hundreds of steps) strongly validates our project's core motivation.
+
+As a critical first step towards our own implementation, we have successfully implemented and trained a core unconditional, \emph{image-space} Flow Matching model. This implementation correctly learns to map Gaussian noise to images from our chosen datasets (CIFAR-10, CelebA). This successful preliminary work de-risks our project significantly, as it validates our understanding and implementation of the FM regression objective (Eq.~\ref{eq:lfm_loss}) before adding the complexity of the VAE latent space.
+
+Finally, we have finalized our datasets, evaluation protocols (PSNR, SSIM), and our latent-space conditioning strategy (as detailed in Section 3). We have all necessary components (pretrained VAE, FM codebase, baselines) ready for integration.
+
+\section{Future Plans}
+
+Our plan for the remainder of the project is divided into three distinct phases with clear responsibilities and estimated completion dates, presented here in prose. Our immediate next step, and first major milestone, is the full implementation of the Latent Flow Matching model. This task, due by \textbf{November 11, 2025}, will be led by \textbf{Cheng Zhang}, \textbf{Xiaowei Yin}, and \textbf{Chenrui Li}. It involves integrating the pretrained VAE with our validated FM training core and implementing the inpainting-specific latent conditioning mechanism ($c = \text{concat}[z_m, \overline{m}]$) as detailed in our Methods section.
+
+Following a successful implementation, we will proceed to the model training and comparative analysis phase, with a target completion date of \textbf{November 25, 2025}. \textbf{Chenrui Li} and \textbf{Lianrui Geng} will lead this effort. They will train the LFM model on both CIFAR-10 and CelebA datasets and conduct a rigorous comparison against our established PDE, GAN, and LDM baselines. This analysis will include generating extensive qualitative visual grids for various mask types and computing quantitative metrics, specifically Peak Signal-to-Noise Ratio (PSNR) and the Structural Similarity Index (SSIM).
+
+The final phase, due by \textbf{December 2, 2025}, will focus on a critical analysis of computational performance. This is essential to validating our central hypothesis. \textbf{Xiaowei Yin} and \textbf{Lianrui Geng} will be responsible for profiling and comparing the inference speed (wall-clock time vs. NFE) and GPU memory consumption of our LFM model. This will be benchmarked directly against our LDM baseline and our image-space FM implementation. This analysis will quantify the practical benefits of the LFM approach. Upon completion of this phase, all team members will contribute to synthesizing these findings into the final report and presentation.
+
+% References do not count towards the 4-page limit.
+% Using \small to save space.
+\small
+\bibliographystyle{plainnat}
+\begin{thebibliography}{9}
+
+
+\bibitem[Dao et~al.(2023)Dao, Phung, Tran, and Nguyen]{Dao2023}
+Q.~Dao, H.~Phung, A.~Tran, and B.~Nguyen.
+\newblock Flow matching in latent space.
+\newblock \emph{arXiv:2307.08698}, 2023.
+
+\bibitem[Pathak et~al.(2016)Pathak, Krahenbuhl, Donahue, Darrell, and Efros]{Pathak2016}
+D.~Pathak, P.~Krahenbuhl, J.~Donahue, T.~Darrell, and A.~A. Efros.
+\newblock Context encoders: Feature learning by inpainting.
+\newblock In \emph{Proc. IEEE CVPR}, 2016.
+
+\bibitem[Van~den Oord et~al.(2017)Van~den Oord, Vinyals, and Kavukcuoglu]{van2017neural}
+A.~Van~Den Oord, O.~Vinyals, and K.~Kavukcuoglu.
+\newblock Neural discrete representation learning.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2017.
+
+\bibitem[Razavi et~al.(2019)Razavi, Van~den Oord, and Vinyals]{razavi2019generating}
+A.~Razavi, A.~Van~Den Oord, and O.~Vinyals.
+\newblock Generating diverse high-fidelity images with {VQ-VAE-2}.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, volume~32, 2019.
+
+\bibitem[Bertalmio et~al.(2000)Bertalmio, Sapiro, Caselles, and Ballester]{Bertalmio2000}
+M.~Bertalmio, G.~Sapiro, V.~Caselles, and C.~Ballester.
+\newblock Image inpainting.
+\newblock In \emph{Proc. SIGGRAPH}, 2000.
+
+\bibitem[Bertalmio et~al.(2001)Bertalmio, Bertozzi, and Sapiro]{Bertalmio2001}
+M.~Bertalmio, A.~L. Bertozzi, and G.~Sapiro.
+\newblock Navier--Stokes, fluid dynamics, and image and video inpainting.
+\newblock In \emph{Proc. IEEE CVPR}, 2001.
+
+\bibitem[Kingma and Welling(2013)]{Kingma2013}
+D.~P. Kingma and M.~Welling.
+\newblock Auto-encoding variational bayes.
+\newblock \emph{arXiv:1312.6114}, 2013.
+
+\bibitem[Lipman et~al.(2023)Lipman, Chen, Ben-Hamu, Nickel, and Le]{Lipman2023}
+Y.~Lipman, R.~T.~Q. Chen, H.~Ben-Hamu, M.~Nickel, and M.~Le.
+\newblock Flow matching for generative modeling.
+\newblock In \emph{ICLR}, 2023.
+
+\bibitem[Rombach et~al.(2022)Rombach, Blattmann, Lorenz, Esser, and Ommer]{Rombach2022}
+R.~Rombach, A.~Blattmann, D.~Lorenz, P.~Esser, and B.~Ommer.
+\newblock High-resolution image synthesis with latent diffusion models.
+\newblock In \emph{Proc. IEEE CVPR}, 2022.
+
+\bibitem[Vahdat et~al.(2021)Vahdat, Kreis, and Kautz]{Vahdat2021}
+A.~Vahdat, K.~Kreis, and J.~Kautz.
+\newblock Score-based generative modeling in latent space.
+\newblock In \emph{NeurIPS}, 2021.
+
+\end{thebibliography}
+
+\end{document}
